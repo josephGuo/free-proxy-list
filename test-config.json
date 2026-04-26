@@ -1,0 +1,65 @@
+{
+  "protocols": [
+    {
+      "name": "http",
+      "filePath": "list/http.txt",
+      "enabled": true,
+      "options": {}
+    },
+    {
+      "name": "https",
+      "filePath": "list/https.txt",
+      "enabled": true,
+      "options": {}
+    },
+    {
+      "name": "socks4",
+      "filePath": "list/socks4.txt",
+      "enabled": true,
+      "options": {}
+    },
+    {
+      "name": "socks5",
+      "filePath": "list/socks5.txt",
+      "enabled": true,
+      "options": {}
+    },
+    {
+      "name": "ss",
+      "filePath": "list/ss.txt",
+      "enabled": false,
+      "options": {}
+    },
+    {
+      "name": "ssr",
+      "filePath": "list/ssr.txt",
+      "enabled": false,
+      "options": {}
+    },
+    {
+      "name": "vmess",
+      "filePath": "list/vmess.txt",
+      "enabled": false,
+      "options": {}
+    },
+    {
+      "name": "vless",
+      "filePath": "list/vless.txt",
+      "enabled": false,
+      "options": {}
+    },
+    {
+      "name": "trojan",
+      "filePath": "list/trojan.txt",
+      "enabled": false,
+      "options": {}
+    }
+  ],
+  "testUrls": [
+    "http://httpbin.org/ip",
+    "http://httpbin.org/get",
+    "https://api.ipify.org?format=json",
+    "https://httpbin.org/ip"
+  ],
+  "timeout": 15
+}
