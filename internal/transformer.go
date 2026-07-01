@@ -4,50 +4,177 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	maxRegexLinkCount         = 32
+	maxRegexLinkResponseBytes = 10 * 1024 * 1024
+)
+
 var (
-	Transformers = map[string]Transformer{}
+	Transformers               = map[string]Transformer{}
+	allowPrivateRegexLinkHosts = false
+	errUnsafeRegexLinkRedirect = errors.New("unsafe regex link redirect")
+	regexLinkClient            = &http.Client{
+		Transport: client.Transport,
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			if !isAllowedRegexLink(req.URL.String()) {
+				return errUnsafeRegexLinkRedirect
+			}
+			return nil
+		},
+	}
 )
 
 func init() {
 	Transformers["base64"] = FromBase64
 	Transformers["clash"] = FromClash
+	Transformers["link"] = FromLinks
 }
 
-type Transformer func([]byte) []byte
+type Transformer func(data []byte, options string) []byte
 
 func RegisterTransformer(name string, t Transformer) {
 	Transformers[name] = t
 }
 
-func GetTransformer(name string) Transformer {
+func GetTransformer(spec string) (Transformer, string) {
+	name, options := parseTransformerSpec(spec)
 	if t, ok := Transformers[name]; ok {
-		return t
+		return t, options
 	}
 
-	return FromRaw
+	return FromRaw, ""
 }
 
-func FromRaw(buf []byte) []byte {
+func parseTransformerSpec(spec string) (string, string) {
+	name, options, _ := strings.Cut(spec, ":")
+	return strings.TrimSpace(name), strings.TrimSpace(options)
+}
+
+func FromRaw(buf []byte, _ string) []byte {
 	return buf
 }
 
-func FromBase64(buf []byte) []byte {
+func FromBase64(buf []byte, _ string) []byte {
 	decoded, err := base64.StdEncoding.DecodeString(string(buf))
 	if err != nil {
 		return buf
 	}
 
 	return decoded
+}
+
+var linkURLPattern = regexp.MustCompile(`https?://[^\s"'<>]+`)
+
+// FromLinks extracts link-like URLs from a document, optionally filters them by
+// keyword, downloads each unique URL, and applies the selected transformer to
+// the downloaded content before merging it into the result.
+func FromLinks(buf []byte, spec string) []byte {
+	transformer, keyword := parseLinkSpec(spec)
+
+	matches := linkURLPattern.FindAll(buf, -1)
+	if len(matches) == 0 {
+		return []byte{}
+	}
+
+	var result bytes.Buffer
+	seen := map[string]struct{}{}
+	for _, match := range matches {
+		rawURL := strings.Trim(string(match), " 	\r\n\"'<>)]}")
+		if keyword != "" && !strings.Contains(rawURL, keyword) {
+			continue
+		}
+		if _, ok := seen[rawURL]; ok || !isAllowedRegexLink(rawURL) {
+			continue
+		}
+		if len(seen) >= maxRegexLinkCount {
+			break
+		}
+		seen[rawURL] = struct{}{}
+
+		resp, err := regexLinkClient.Get(rawURL)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+			resp.Body.Close() // nolint: errcheck
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRegexLinkResponseBytes+1))
+		resp.Body.Close() // nolint: errcheck
+		if err != nil || len(body) > maxRegexLinkResponseBytes {
+			continue
+		}
+
+		result.Write(bytes.TrimSpace(transformer(body, "")))
+		result.WriteByte('\n')
+	}
+
+	return result.Bytes()
+}
+
+func parseLinkSpec(spec string) (Transformer, string) {
+	if spec == "" {
+		return FromRaw, ""
+	}
+	if t, ok := Transformers[spec]; ok {
+		return t, ""
+	}
+	for name, t := range Transformers {
+		prefix := name + "-"
+		if strings.HasPrefix(spec, prefix) {
+			return t, strings.TrimPrefix(spec, prefix)
+		}
+	}
+	return FromRaw, spec
+}
+
+func isAllowedRegexLink(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if allowPrivateRegexLinkHosts {
+		return true
+	}
+
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") || IsLocal(host) {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return !IsLocal(ip.String()) && isPublicIP(ip)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil || len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips {
+		if !isPublicIP(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+func isPublicIP(ip net.IP) bool {
+	return !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() && !ip.IsLinkLocalMulticast() && !ip.IsUnspecified()
 }
 
 // FlexPort handles YAML port values that may be int, float, or string.
@@ -151,7 +278,7 @@ type ClashConfig struct {
 }
 
 // FromClash parses a Clash YAML config and extracts proxy URLs.
-func FromClash(buf []byte) []byte {
+func FromClash(buf []byte, _ string) []byte {
 	// Limit YAML size to prevent OOM attacks (10MB max)
 	const maxYAMLSize = 10 * 1024 * 1024
 	if len(buf) > maxYAMLSize {

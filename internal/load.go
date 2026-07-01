@@ -3,12 +3,12 @@ package internal
 import (
 	"bufio"
 	"bytes"
-	"log"
-	"strings"
 	"fmt"
-	"time"
+	"log"
 	"regexp"
 	"strconv"
+	"strings"
+	"time"
 )
 
 func Load(proto string, content []byte) error {
@@ -17,6 +17,7 @@ func Load(proto string, content []byte) error {
 
 	var line, src string
 	var transformer Transformer
+	var transformerOptions string
 	var parser Parser
 	for s.Scan() {
 		line = strings.TrimSpace(s.Text())
@@ -25,13 +26,13 @@ func Load(proto string, content []byte) error {
 		}
 
 		if strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "http://") {
-			src, transformer, parser = parseLine(line)
+			src, transformer, transformerOptions, parser = parseLine(line)
 
 			if src == "" {
 				continue
 			}
 
-			log.Printf("> %v %s", Fetch(proto, src, transformer, parser), src)
+			log.Printf("> %v %s", Fetch(proto, src, transformer, transformerOptions, parser), src)
 		}
 
 	}
@@ -43,16 +44,16 @@ func roundToNearestIncrement(currentHour int, increment int) int {
 	if increment <= 0 || increment > 24 {
 		return currentHour
 	}
-	
+
 	// Generate valid hours based on increment
 	var validHours []int
 	for h := 0; h < 24; h += increment {
 		validHours = append(validHours, h)
 	}
-	
+
 	closest := 0
 	minDiff := 24
-	
+
 	for _, validHour := range validHours {
 		diff := currentHour - validHour
 		if diff < 0 {
@@ -61,13 +62,13 @@ func roundToNearestIncrement(currentHour int, increment int) int {
 		if diff > 12 {
 			diff = 24 - diff
 		}
-		
+
 		if diff < minDiff {
 			minDiff = diff
 			closest = validHour
 		}
 	}
-	
+
 	return closest
 }
 
@@ -104,13 +105,14 @@ func applyTokenizer(url string) string {
 	return url
 }
 
-func parseLine(line string) (string, Transformer, Parser) {
+func parseLine(line string) (string, Transformer, string, Parser) {
 
 	if strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "http://") {
 		items := strings.Split(line, ",")
 
 		var src string
 		transformer := FromRaw
+		transformerOptions := ""
 		parser := ParseProxyURL
 
 		if len(items) > 0 {
@@ -118,15 +120,15 @@ func parseLine(line string) (string, Transformer, Parser) {
 		}
 
 		if len(items) > 1 {
-			transformer = GetTransformer(strings.TrimSpace(items[1]))
+			transformer, transformerOptions = GetTransformer(strings.TrimSpace(items[1]))
 		}
 
 		if len(items) > 2 {
 			parser = GetParser(strings.TrimSpace(items[2]))
 		}
 
-		return src, transformer, parser
+		return src, transformer, transformerOptions, parser
 	}
 
-	return "", nil, nil
+	return "", nil, "", nil
 }

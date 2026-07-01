@@ -3,6 +3,9 @@ package internal
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -54,8 +57,8 @@ socks-port: 7891`,
 			expected: "",
 		},
 		{
-			name: "empty input",
-			input: "",
+			name:     "empty input",
+			input:    "",
 			expected: "",
 		},
 		{
@@ -281,22 +284,22 @@ socks-port: 7891`,
 		{
 			// 10MB is the maxYAMLSize boundary: input passes the size gate and
 			// reaches the YAML parser, which fails on non-YAML content, so output is empty.
-			name: "input at 10MB size limit reaches parser and yields empty output on parse failure",
-			input: strings.Repeat("x", 10*1024*1024),
+			name:     "input at 10MB size limit reaches parser and yields empty output on parse failure",
+			input:    strings.Repeat("x", 10*1024*1024),
 			expected: "",
 		},
 		{
 			// 11MB exceeds maxYAMLSize: input is rejected by the size gate
 			// before YAML parsing, so output is empty without a parse attempt.
-			name: "input above 10MB size limit rejected by size gate before parsing",
-			input: strings.Repeat("x", 11*1024*1024), // 11MB
+			name:     "input above 10MB size limit rejected by size gate before parsing",
+			input:    strings.Repeat("x", 11*1024*1024), // 11MB
 			expected: "",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := string(FromClash([]byte(tt.input)))
+			result := string(FromClash([]byte(tt.input), ""))
 			if result != tt.expected {
 				t.Errorf("FromClash() = %q, want %q", result, tt.expected)
 			}
@@ -381,7 +384,7 @@ func TestVmessURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := string(FromClash([]byte(tt.input)))
+			result := string(FromClash([]byte(tt.input), ""))
 			if tt.name == "vmess missing uuid skipped" {
 				if result != "" {
 					t.Errorf("expected empty result for missing uuid, got %q", result)
@@ -644,7 +647,7 @@ func TestVlessURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := string(FromClash([]byte(tt.input)))
+			result := string(FromClash([]byte(tt.input), ""))
 
 			if tt.checkURL == nil {
 				if result != "" {
@@ -904,7 +907,7 @@ func TestTrojanURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := string(FromClash([]byte(tt.input)))
+			result := string(FromClash([]byte(tt.input), ""))
 
 			if tt.checkURL == nil {
 				if result != "" {
@@ -958,7 +961,7 @@ func TestMixedProtocols(t *testing.T) {
     server: 5.6.7.8
     port: 1080`
 
-	result := string(FromClash([]byte(input)))
+	result := string(FromClash([]byte(input), ""))
 	lines := strings.Split(strings.TrimSpace(result), "\n")
 
 	if len(lines) != 6 {
@@ -995,6 +998,140 @@ func parseTrojanTestURL(rawURL string) (*url.URL, error) {
 	return url.Parse(rawURL)
 }
 
+func TestFromLinksDownloadsKeywordMatchesAndAppliesTransformer(t *testing.T) {
+	allowPrivateRegexLinkHosts = true
+	defer func() { allowPrivateRegexLinkHosts = false }()
+
+	requests := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests[r.URL.Path]++
+		switch r.URL.Path {
+		case "/base64-fn0618.txt":
+			encoded := base64.StdEncoding.EncodeToString([]byte("http://1.2.3.4:8080\n"))
+			_, _ = w.Write([]byte(encoded))
+		case "/clash-fn0618.yaml":
+			_, _ = w.Write([]byte("proxies:\n  - name: socks\n    type: socks5\n    server: 5.6.7.8\n    port: 1080\n"))
+		case "/other.txt":
+			_, _ = w.Write([]byte("http://9.9.9.9:9090\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	readme := []byte("sources:\n- " + server.URL + "/base64-fn0618.txt\n- " + server.URL + "/other.txt\n- " + server.URL + "/base64-fn0618.txt\n")
+	transformer, transformerOptions := GetTransformer("link:base64-fn0618")
+
+	got := string(transformer(readme, transformerOptions))
+	want := "http://1.2.3.4:8080\n"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+	if requests["/base64-fn0618.txt"] != 1 {
+		t.Fatalf("expected duplicate keyword link to be fetched once, got %d requests", requests["/base64-fn0618.txt"])
+	}
+	if requests["/other.txt"] != 0 {
+		t.Fatalf("expected non-keyword link not to be fetched, got %d requests", requests["/other.txt"])
+	}
+
+	clashTransformer, clashTransformerOptions := GetTransformer("link:clash-fn0618")
+	got = string(clashTransformer([]byte("source: "+server.URL+"/clash-fn0618.yaml\n"), clashTransformerOptions))
+	want = "socks5://5.6.7.8:1080\n"
+	if got != want {
+		t.Fatalf("expected %q, got %q", want, got)
+	}
+}
+
+func TestFromLinksAppliesKeywordBeforeFanOutLimit(t *testing.T) {
+	allowPrivateRegexLinkHosts = true
+	defer func() { allowPrivateRegexLinkHosts = false }()
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("http://1.2.3.4:8080\n"))
+	}))
+	defer server.Close()
+
+	links := make([]string, 0, maxRegexLinkCount+1)
+	for i := 0; i < maxRegexLinkCount; i++ {
+		links = append(links, fmt.Sprintf("%s/asset-%d.css", server.URL, i))
+	}
+	links = append(links, server.URL+"/proxy-fn0618.txt")
+
+	transformer, transformerOptions := GetTransformer("link:fn0618")
+	got := string(transformer([]byte(strings.Join(links, "\n")), transformerOptions))
+	if got != "http://1.2.3.4:8080\n" {
+		t.Fatalf("expected keyword link after non-keyword matches to be fetched, got %q", got)
+	}
+	if requests != 1 {
+		t.Fatalf("expected only keyword link to be fetched, got %d requests", requests)
+	}
+}
+
+func TestRegexLinkRedirectsRejectPrivateTargets(t *testing.T) {
+	allowPrivateRegexLinkHosts = false
+
+	req, err := http.NewRequest(http.MethodGet, "http://169.254.169.254/latest/meta-data", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := regexLinkClient.CheckRedirect(req, nil); err == nil {
+		t.Fatal("expected private redirect target to be rejected")
+	}
+}
+
+func TestFromLinksRejectsPrivateTargets(t *testing.T) {
+	allowPrivateRegexLinkHosts = false
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("http://1.2.3.4:8080\n"))
+	}))
+	defer server.Close()
+
+	transformer, transformerOptions := GetTransformer("link:private")
+	got := string(transformer([]byte("source: "+server.URL+"/private.txt\n"), transformerOptions))
+	if got != "" {
+		t.Fatalf("expected private target to be skipped, got %q", got)
+	}
+	if requests != 0 {
+		t.Fatalf("expected private target not to be requested, got %d requests", requests)
+	}
+}
+
+func TestFromLinksLimitsFanOutAndBodySize(t *testing.T) {
+	allowPrivateRegexLinkHosts = true
+	defer func() { allowPrivateRegexLinkHosts = false }()
+
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path == "/oversize.txt" {
+			_, _ = w.Write([]byte(strings.Repeat("x", maxRegexLinkResponseBytes+1)))
+			return
+		}
+		_, _ = w.Write([]byte("http://1.2.3.4:8080\n"))
+	}))
+	defer server.Close()
+
+	links := make([]string, 0, maxRegexLinkCount+2)
+	for i := 0; i < maxRegexLinkCount+1; i++ {
+		links = append(links, fmt.Sprintf("%s/fn0618-%d.txt", server.URL, i))
+	}
+	links[0] = server.URL + "/oversize.txt?tag=fn0618"
+
+	transformer, transformerOptions := GetTransformer("link:fn0618")
+	got := string(transformer([]byte(strings.Join(links, "\n")), transformerOptions))
+	if strings.Contains(got, strings.Repeat("x", 32)) {
+		t.Fatalf("expected oversized response to be skipped")
+	}
+	if requests != maxRegexLinkCount {
+		t.Fatalf("expected at most %d requests, got %d", maxRegexLinkCount, requests)
+	}
+}
+
 // TestFlexPortFloatRejection locks the contract that float ports must be
 // integral, finite, and within the valid TCP/UDP range. Catches CodeRabbit's
 // concern that int(f) silently truncates non-integer floats and accepts
@@ -1022,7 +1159,7 @@ func TestFlexPortFloatRejection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			yaml := "proxies:\n  - name: test\n    type: http\n    server: example.com\n    port: " + tt.yamlPort + "\n"
-			result := string(FromClash([]byte(yaml)))
+			result := string(FromClash([]byte(yaml), ""))
 			if tt.wantEmpty && result != "" {
 				t.Errorf("port %q: expected empty result, got %q", tt.yamlPort, result)
 			}
