@@ -135,3 +135,4 @@ https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/refs/heads/ma
 https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/refs/heads/main/servers/vmess_servers.txt
 https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/v2ray/all_sub.txt
 https://raw.githubusercontent.com/ssrsub/ssr/master/v2ray,base64,
+https://www.v2nodes.com/subscriptions/country/all/?key=45FF29821C5F021,base64,
