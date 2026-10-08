@@ -12,31 +12,76 @@ import (
 )
 
 func Load(proto string, content []byte) error {
+	return load(proto, content, false)
+}
 
+func ValidateSource(proto string, content []byte) error {
+	return load(proto, content, true)
+}
+
+func load(proto string, content []byte, validate bool) error {
 	s := bufio.NewScanner(bytes.NewReader(content))
-
 	var line, src string
+	lineNumber := 0
+	feedCount := 0
 	var transformer Transformer
 	var transformerOptions string
 	var parser Parser
 	for s.Scan() {
+		lineNumber++
 		line = strings.TrimSpace(s.Text())
 		if line == "" {
 			continue
 		}
 
 		if strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "http://") {
-			src, transformer, transformerOptions, parser = parseLine(line)
-
-			if src == "" {
+			feedCount++
+			transformerName := ""
+			if items := strings.Split(line, ","); len(items) > 1 {
+				transformerName, _ = parseTransformerSpec(strings.TrimSpace(items[1]))
+			}
+			var err error
+			src, transformer, transformerOptions, parser, err = parseLine(line)
+			if err != nil {
+				if validate {
+					return fmt.Errorf("line %d: invalid source configuration: %w", lineNumber, err)
+				}
+				log.Printf("line %d: invalid source configuration: %v", lineNumber, err)
 				continue
 			}
+			if src == "" {
+				if validate {
+					return fmt.Errorf("line %d: invalid feed URL", lineNumber)
+				}
+				continue
+			}
+			if transformerName == "json" {
+				if err := validateJSONTransformerOptions(transformerOptions); err != nil {
+					return fmt.Errorf("line %d: invalid json transformer: %w", lineNumber, err)
+				}
+			}
 
-			log.Printf("> %v %s", Fetch(proto, src, transformer, transformerOptions, parser), src)
+			var count int
+			if transformerName == "curl" {
+				count = FetchCurl(proto, src, transformerOptions, parser)
+			} else {
+				count = Fetch(proto, src, transformer, transformerOptions, parser)
+			}
+			log.Printf("> %v %s", count, src)
+			if validate && count == 0 {
+				return fmt.Errorf("line %d: feed %s produced no valid proxies", lineNumber, src)
+			}
+		} else if validate {
+			return fmt.Errorf("line %d: expected an http(s) feed URL", lineNumber)
 		}
-
 	}
 
+	if err := s.Err(); err != nil {
+		return err
+	}
+	if validate && feedCount == 0 {
+		return fmt.Errorf("no feed URLs found")
+	}
 	return nil
 }
 
@@ -105,7 +150,7 @@ func applyTokenizer(url string) string {
 	return url
 }
 
-func parseLine(line string) (string, Transformer, string, Parser) {
+func parseLine(line string) (string, Transformer, string, Parser, error) {
 
 	if strings.HasPrefix(line, "https://") || strings.HasPrefix(line, "http://") {
 		items := strings.Split(line, ",")
@@ -124,11 +169,15 @@ func parseLine(line string) (string, Transformer, string, Parser) {
 		}
 
 		if len(items) > 2 {
-			parser = GetParser(strings.TrimSpace(items[2]))
+			var err error
+			parser, err = GetParser(strings.TrimSpace(items[2]))
+			if err != nil {
+				return "", nil, "", nil, err
+			}
 		}
 
-		return src, transformer, transformerOptions, parser
+		return src, transformer, transformerOptions, parser, nil
 	}
 
-	return "", nil, "", nil
+	return "", nil, "", nil, fmt.Errorf("expected an http(s) feed URL")
 }

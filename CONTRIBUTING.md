@@ -49,6 +49,8 @@ The application reads files from the `sources/` directory. Each file in this dir
 
 Sometimes, a source provides data in a non-standard format. Our application uses **Transformers** and **Parsers** to handle these cases. You can specify them in the source file on the same line as the URL, separated by commas.
 
+See the [Transformer Reference](internal/transformers.md) for detailed behavior and configuration examples.
+
 **URL Tokens:**
 
 You can use dynamic tokens in the source URLs to fetch lists that are generated based on the current date and time. The application will replace these tokens with the current values.
@@ -64,8 +66,8 @@ You can use dynamic tokens in the source URLs to fetch lists that are generated 
 **Format:** `url,transformer,parser`
 
 -   **`url`**: (Required) The URL of the proxy list.
--   **`transformer`**: (Optional) Specifies how to transform the raw data before parsing. The default is `raw` (no transformation). Transformer options use `name[:options]`. We also have `base64` for sources encoded in Base64, `clash` for Clash YAML, and `link[:transformer-keyword]` for extracting link-like strings from documents such as README files. For example, `link:base64-fn0618` fetches links containing `fn0618`, decodes each linked response as Base64, and merges the transformed proxy links before parsing.
--   **`parser`**: (Optional) Specifies how to parse individual lines from the source. The default `ParseProxyURL` handles standard proxy URLs. Other options include `ColonURL` (for `ip:port` formats) and `SpaceURL` (for `ip port` formats).
+-   **`transformer`**: (Optional) Specifies how to transform the raw data before parsing. The default is `raw` (no transformation). Transformer options use `name[:options]`. We also have `base64` for sources encoded in Base64, `mtproto` for extracting Telegram MTProto proxy links (`tg://proxy` and `t.me/proxy`) from text feeds, `json` for mapping JSON records to proxy URI lines (for example, `json:path=$[*];scheme=protocol;host=ip;port=port`), `clash` for Clash YAML, `link[:transformer-keyword]` for extracting and fetching links from documents, and `list[:transformer]` for downloading URLs listed one per line and transforming each response. For example, `list:clash` downloads a list of Clash subscription URLs, converts each response to proxy URI lines, and merges them before parsing. `link:base64-fn0618` fetches links containing `fn0618`, decodes each linked response as Base64, and merges the transformed proxy links. The `curl` transformer uses curl-impersonate, scans the current page, and automatically follows detected pagination links; it can also fetch matching child pages at depth `1`. It finds all supported proxy schemes by default or accepts a `+`-separated finder list, such as `curl:1-/servers/-ss+trojan+vless`. Its built-in `dom` finder accepts CSS selectors for each URL field and a template, for example: `curl:dom;row=tbody.table-proxy-list tr;protocol=td:nth-child(4);host=th.tblport;port=td.tblport;template={protocol}://{host}:{port}`. Field selectors return element text by default; append `@attribute` to read an attribute instead. The example assembles mixed-protocol entries from `https://freeproxylist.ru/en/?page=1`.
+-   **`parser`**: (Optional) Specifies how to parse individual lines from the source. The default `ParseProxyURL` handles standard proxy URLs. Other options include `ColonURL` (for `ip:port` formats), `SpaceURL` (for `ip port` formats), `IPv4Auth` (for `IPv4:port:username:password` formats), and `Split:separator=comma;host=0;port=1` for delimited fields. The configurable `Split` parser also supports whitespace or a single-character separator and zero-based column indexes. For rows with an `ip:port` field and an explicit protocol column, use `Split:separator=comma;endpoint=0;protocol=1`; records whose protocol does not match the source file are skipped.
 
 **Example:**
 

@@ -1,8 +1,11 @@
 package internal
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"log/slog"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -13,38 +16,57 @@ import (
 )
 
 var (
-	Parsers = map[string]Parser{}
+	Parsers         = map[string]Parser{}
+	ParserFactories = map[string]ParserFactory{}
 
 	ErrInvalidProxy = errors.New("gfp: invalid proxy")
 )
 
 const (
 	// MaxSchemeLength defines the maximum allowed length for proxy scheme.
-	// Legitimate proxy protocols (http, https, socks4, socks5, vmess, trojan, vless, ss, ssr, hy, hy2)
+	// Legitimate proxy protocols (http, https, socks4, socks5, vmess, trojan, vless, ss, ssr, tg, hy, hy2)
 	// are all 6 characters or less. 15 provides safe headroom for future protocols.
 	MaxSchemeLength = 15
 )
 
 type Parser func(string, string) (*Proxy, error)
+type ParserFactory func(string) (Parser, error)
 
 func RegisterParser(name string, parser Parser) {
 	Parsers[name] = parser
 }
 
-func GetParser(name string) Parser {
+func RegisterParserFactory(name string, factory ParserFactory) {
+	ParserFactories[name] = factory
+}
+
+func GetParser(spec string) (Parser, error) {
+	name, options, hasOptions := strings.Cut(spec, ":")
+	if factory, ok := ParserFactories[name]; ok {
+		return factory(options)
+	}
+	if hasOptions {
+		return nil, errors.New("parser does not accept options")
+	}
 	if parser, ok := Parsers[name]; ok {
-		return parser
+		return parser, nil
 	}
 
-	return ParseProxyURL
+	return ParseProxyURL, nil
 }
 
 func init() {
 	Parsers["ColonURL"] = ParseColonURL
 	Parsers["SpaceURL"] = ParseSpaceURL
+	Parsers["IPv4Auth"] = ParseIPv4Auth
+	RegisterParserFactory("Split", newSplitParser)
 }
 
 func ParseProxyURL(proto, proxyURL string) (*Proxy, error) {
+	if fields := strings.Fields(proxyURL); len(fields) > 0 {
+		proxyURL = fields[0]
+	}
+
 	if !strings.Contains(proxyURL, "://") {
 		proxyURL = proto + "://" + proxyURL
 	}
@@ -71,6 +93,10 @@ func ParseProxyURL(proto, proxyURL string) (*Proxy, error) {
 		scheme = "hy2"
 		proxyURL = "hy2://" + strings.TrimPrefix(proxyURL, u.Scheme+"://")
 		u, _ = url.Parse(proxyURL)
+	}
+
+	if scheme == "tg" || (strings.EqualFold(proto, "tg") && isTelegramProxyLink(u)) {
+		return parseMTProtoProxyURL(u)
 	}
 
 	var it *Proxy
@@ -173,6 +199,9 @@ func ParseProxyURL(proto, proxyURL string) (*Proxy, error) {
 		it.Protocol = scheme
 	}
 
+	if isIPLiteralCandidate(it.IP) && net.ParseIP(it.IP) == nil {
+		return nil, ErrInvalidProxy
+	}
 	if IsLocal(it.IP) {
 		return nil, ErrInvalidProxy
 	}
@@ -187,8 +216,131 @@ func ParseProxyURL(proto, proxyURL string) (*Proxy, error) {
 	return it, nil
 }
 
+func isTelegramProxyLink(u *url.URL) bool {
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return false
+	}
+
+	host := strings.ToLower(u.Hostname())
+	return (host == "t.me" || host == "telegram.me") && u.Path == "/proxy"
+}
+
+func parseMTProtoProxyURL(u *url.URL) (*Proxy, error) {
+	if strings.EqualFold(u.Scheme, "tg") {
+		if !strings.EqualFold(u.Hostname(), "proxy") || (u.Path != "" && u.Path != "/") {
+			return nil, ErrInvalidProxy
+		}
+	} else if !isTelegramProxyLink(u) {
+		return nil, ErrInvalidProxy
+	}
+
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return nil, ErrInvalidProxy
+	}
+
+	server := query.Get("server")
+	portValue := query.Get("port")
+	secret := query.Get("secret")
+	if len(query["server"]) != 1 || len(query["port"]) != 1 || len(query["secret"]) != 1 ||
+		server == "" || portValue == "" || !isValidMTProtoSecret(secret) {
+		return nil, ErrInvalidProxy
+	}
+
+	port, err := strconv.Atoi(portValue)
+	if err != nil || port < 1 || port > 65535 {
+		return nil, ErrInvalidProxy
+	}
+	if isIPLiteralCandidate(server) && net.ParseIP(server) == nil {
+		return nil, ErrInvalidProxy
+	}
+	if IsLocal(server) || isPrivateMTProtoServer(server) || !proxyclient.IsHost(server) {
+		return nil, ErrInvalidProxy
+	}
+
+	normalizedQuery := url.Values{
+		"server": {server},
+		"port":   {strconv.Itoa(port)},
+		"secret": {secret},
+	}
+	return &Proxy{
+		IP:       server,
+		Port:     port,
+		Opaque:   "proxy?" + normalizedQuery.Encode(),
+		Protocol: "tg",
+	}, nil
+}
+
+func isValidMTProtoSecret(secret string) bool {
+	if decoded, err := hex.DecodeString(secret); err == nil {
+		switch {
+		case len(decoded) == 16:
+			return true
+		case strings.HasPrefix(strings.ToLower(secret), "dd") && len(decoded) == 17:
+			return true
+		case strings.HasPrefix(strings.ToLower(secret), "ee") && len(decoded) >= 17:
+			return true
+		}
+	}
+
+	for _, encoding := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding} {
+		if decoded, err := encoding.DecodeString(secret); err == nil && len(decoded) == 16 {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrivateMTProtoServer(server string) bool {
+	ip := net.ParseIP(server)
+	if ip == nil {
+		return false
+	}
+	return !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+}
+
+func isIPLiteralCandidate(host string) bool {
+	// Callers pass URL.Hostname output, so the port is already removed and colons indicate IPv6 syntax.
+	if strings.Contains(host, ":") {
+		return true
+	}
+
+	parts := strings.Split(host, ".")
+	if len(parts) != 4 {
+		return false
+	}
+
+	numericParts := 0
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		numeric := true
+		for _, char := range part {
+			if char < '0' || char > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric {
+			numericParts++
+		}
+	}
+	return numericParts >= 3
+}
+
 func IsLocal(ip string) bool {
-	return strings.HasPrefix(ip, "0.") || strings.HasPrefix(ip, "127.") || strings.HasPrefix(ip, "169.254.")
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return strings.HasPrefix(ip, "0.") || strings.HasPrefix(ip, "127.") || strings.HasPrefix(ip, "169.254.")
+	}
+	if ipv4 := parsedIP.To4(); ipv4 != nil {
+		ip = ipv4.String()
+		return strings.HasPrefix(ip, "0.") || strings.HasPrefix(ip, "127.") || strings.HasPrefix(ip, "169.254.")
+	}
+	return parsedIP.IsLoopback() || parsedIP.IsLinkLocalUnicast() || parsedIP.IsPrivate() || parsedIP.IsUnspecified()
 }
 
 func ParseColonURL(proto, proxyURL string) (*Proxy, error) {
@@ -199,6 +351,144 @@ func ParseColonURL(proto, proxyURL string) (*Proxy, error) {
 	}
 
 	return ParseProxyURL(proto, items[0]+":"+items[1])
+}
+
+func newSplitParser(options string) (Parser, error) {
+	separator := ""
+	var hostColumn, portColumn, endpointColumn, protocolColumn int
+	hasSeparator, hasHost, hasPort, hasEndpoint, hasProtocol := false, false, false, false, false
+	for _, option := range strings.Split(options, ";") {
+		key, value, ok := strings.Cut(option, "=")
+		if !ok {
+			return nil, errors.New("split parser options must be key=value pairs")
+		}
+		switch key {
+		case "separator":
+			if hasSeparator {
+				return nil, errors.New("split parser separator is configured more than once")
+			}
+			separator, hasSeparator = value, true
+			continue
+		}
+		index, err := strconv.Atoi(value)
+		if err != nil || index < 0 {
+			return nil, errors.New("split parser column indexes must be non-negative integers")
+		}
+		switch key {
+		case "host":
+			if hasHost {
+				return nil, errors.New("split parser host column is configured more than once")
+			}
+			hostColumn, hasHost = index, true
+		case "port":
+			if hasPort {
+				return nil, errors.New("split parser port column is configured more than once")
+			}
+			portColumn, hasPort = index, true
+		case "endpoint":
+			if hasEndpoint {
+				return nil, errors.New("split parser endpoint column is configured more than once")
+			}
+			endpointColumn, hasEndpoint = index, true
+		case "protocol":
+			if hasProtocol {
+				return nil, errors.New("split parser protocol column is configured more than once")
+			}
+			protocolColumn, hasProtocol = index, true
+		default:
+			return nil, errors.New("split parser supports only separator, host, port, endpoint, and protocol options")
+		}
+	}
+	if !hasSeparator || separator == "" {
+		return nil, errors.New("split parser requires a separator")
+	}
+	if hasEndpoint {
+		if hasHost || hasPort {
+			return nil, errors.New("split parser endpoint cannot be combined with host or port")
+		}
+		if hasProtocol && protocolColumn == endpointColumn {
+			return nil, errors.New("split parser endpoint and protocol columns must differ")
+		}
+	} else if !hasHost || !hasPort {
+		return nil, errors.New("split parser requires either an endpoint column or host and port column mappings")
+	} else if hasProtocol {
+		return nil, errors.New("split parser protocol requires an endpoint column")
+	}
+	switch separator {
+	case "comma":
+		separator = ","
+	case "space", "whitespace":
+		separator = " "
+	case "tab":
+		separator = "\t"
+	default:
+		if len(separator) != 1 {
+			return nil, errors.New("split parser separator must be comma, whitespace, tab, or one character")
+		}
+	}
+
+	return func(proto, line string) (*Proxy, error) {
+		var record []string
+		if separator == " " {
+			record = strings.Fields(line)
+		} else {
+			record = strings.Split(line, separator)
+		}
+		if hasEndpoint {
+			if endpointColumn >= len(record) {
+				return nil, ErrInvalidProxy
+			}
+			if hasProtocol {
+				if protocolColumn >= len(record) || !strings.EqualFold(strings.TrimSpace(record[protocolColumn]), proto) {
+					return nil, ErrInvalidProxy
+				}
+			}
+			host, port, err := net.SplitHostPort(strings.TrimSpace(record[endpointColumn]))
+			if err != nil || host == "" {
+				return nil, ErrInvalidProxy
+			}
+			portValue, err := strconv.Atoi(port)
+			if err != nil || portValue < 1 || portValue > 65535 {
+				return nil, ErrInvalidProxy
+			}
+			return ParseProxyURL(proto, net.JoinHostPort(host, strconv.Itoa(portValue)))
+		}
+		if hostColumn >= len(record) || portColumn >= len(record) {
+			return nil, ErrInvalidProxy
+		}
+		host := strings.TrimSpace(record[hostColumn])
+		portValue, err := strconv.Atoi(strings.TrimSpace(record[portColumn]))
+		if host == "" || err != nil || portValue < 1 || portValue > 65535 {
+			return nil, ErrInvalidProxy
+		}
+		return ParseProxyURL(proto, net.JoinHostPort(host, strconv.Itoa(portValue)))
+	}, nil
+}
+
+func ParseIPv4Auth(proto, proxyLine string) (*Proxy, error) {
+	items := strings.SplitN(strings.TrimSpace(proxyLine), ":", 4)
+	if len(items) != 4 || items[2] == "" || items[3] == "" {
+		return nil, ErrInvalidProxy
+	}
+
+	ip := items[0]
+	parsedIP := net.ParseIP(ip)
+	if strings.Contains(ip, ":") || parsedIP == nil || parsedIP.To4() == nil || IsLocal(ip) || !proxyclient.IsHost(ip) {
+		return nil, ErrInvalidProxy
+	}
+
+	port, err := strconv.Atoi(items[1])
+	if err != nil || port < 1 || port > 65535 {
+		return nil, ErrInvalidProxy
+	}
+
+	return &Proxy{
+		IP:       ip,
+		Port:     port,
+		User:     items[2],
+		Passwd:   items[3],
+		Protocol: strings.ToLower(proto),
+	}, nil
 }
 
 func ParseSpaceURL(proto, proxyURL string) (*Proxy, error) {
